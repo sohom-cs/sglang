@@ -4716,7 +4716,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Clear the write-through-pending mark (when it matches ack_id) and record the
-    /// host store event for each acked node.
+    /// host store event for each acked node whose Full KV is on host.
     pub fn finish_write_through(
         &mut self,
         node_ids: Vec<NodeId>,
@@ -4732,7 +4732,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 node.write_through_pending_id = None;
                 self.update_full_coexisting_host_tracking_(node_idx);
             }
-            self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
+            // An SWA-window ancestor can be acked with only its SWA KV on host.
+            if self.arena.node(node_idx).backuped() {
+                self.record_store_event_(
+                    node_idx,
+                    StorageMedium::Cpu,
+                    /* session_id = */ None,
+                );
+            }
         }
         Ok(())
     }

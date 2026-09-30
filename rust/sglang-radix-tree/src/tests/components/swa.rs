@@ -6676,3 +6676,43 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
         );
     }
 }
+
+/// A leaf backup that also copies its ancestors' SWA KV must not announce those
+/// ancestors on the host tier: their Full KV never left the device.
+#[test]
+fn swa_window_backup_publishes_host_stores_only_for_full_host_copies() {
+    use crate::unified_tree_core::{KvCacheEvent, StorageMedium};
+    // Chain a -> b -> c: the leaf's SWA window reaches both ancestors.
+    let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(3, 1, false);
+    tc.enable_kv_cache_events = true;
+    commit_internal_swa_backup(&mut tc, c);
+    let mut host_tier = std::collections::HashSet::new();
+    for event in tc.take_events() {
+        match event {
+            KvCacheEvent::BlockStored {
+                block_hashes,
+                medium: StorageMedium::Cpu,
+                ..
+            } => host_tier.extend(block_hashes),
+            KvCacheEvent::BlockRemoved {
+                block_hashes,
+                medium: StorageMedium::Cpu,
+                ..
+            } => block_hashes.iter().for_each(|h| {
+                host_tier.remove(h);
+            }),
+            _ => {}
+        }
+    }
+    let mut held = std::collections::HashSet::new();
+    for (id, full_on_host) in [(a, false), (b, false), (c, true)] {
+        let node = tc.arena.node(tc.arena.resolve(id).unwrap());
+        assert!(node.has_host_value(SWA));
+        assert_eq!(node.backuped(), full_on_host);
+        if full_on_host {
+            let hashes = node.hash_value.as_ref().expect("hashed at publish");
+            held.extend(hashes.iter().map(|h| crate::node::hash_str_to_int64(h)));
+        }
+    }
+    assert_eq!(host_tier, held);
+}

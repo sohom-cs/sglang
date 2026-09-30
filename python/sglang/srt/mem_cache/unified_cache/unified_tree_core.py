@@ -2826,14 +2826,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
-        host store event for each acked node."""
+        host store event for each acked node whose Full KV is on host."""
         for node_id in node_ids:
             node = self.node_by_id(node_id)
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
-            self.kv_events.record_store(node, medium=StorageMedium.CPU)
+            # An SWA-window ancestor can be acked with only its SWA KV on host.
+            if node.backuped:
+                self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
     def _walk_span(self, key: RadixKey, end: int):
         """Yield nodes and their matched spans along ``key`` through ``end``."""

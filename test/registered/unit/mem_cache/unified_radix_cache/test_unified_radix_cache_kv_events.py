@@ -1,10 +1,13 @@
 import unittest
 from array import array
+from collections import defaultdict
 from unittest import mock
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
+    BlockRemoved,
+    BlockStored,
     StorageMedium,
     kv_event_namespace_seed,
     namespaced_block_hash,
@@ -14,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -440,6 +444,64 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(len(stored_cpu[0].block_hashes), 2)
+
+    def test_hicache_swa_window_backup_publishes_only_full_host_copies(self):
+        """A leaf backup whose SWA window also copies an ancestor's SWA KV must not
+        announce the ancestor on the host tier: only its device copy exists, so a
+        later drop removes it from the device tier alone."""
+        from sglang.srt.mem_cache.utils import hash_str_to_int64
+
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
+        )
+        cache, allocator, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        core = cache.tree_core
+        # What init_hicache sets for write_back with an SWA host pool.
+        core.set_hicache_enabled()
+        core.has_swa_host_pool = True
+        core.is_write_back = True
+        self._insert(cache, allocator, list(range(1, 9)))
+        self._insert(cache, allocator, list(range(1, 13)))
+        ancestor = self._leaf_for(cache, list(range(1, 9)))
+        leaf = self._leaf_for(cache, list(range(1, 13)))
+
+        host_tier = set()
+
+        def replay_host_events():
+            for event in cache.take_events():
+                if isinstance(event, BlockStored) and event.medium == StorageMedium.CPU:
+                    host_tier.update(event.block_hashes)
+                elif (
+                    isinstance(event, BlockRemoved)
+                    and event.medium == StorageMedium.CPU
+                ):
+                    host_tier.difference_update(event.block_hashes)
+
+        # Write-back eviction of the leaf: back up, ack, demote.
+        device_value, comp_xfers = core.build_backup_spec(leaf)
+        (swa_xfer,) = comp_xfers[ComponentType.SWA]
+        swa_xfer.host_indices = torch.arange(100, 100 + len(swa_xfer.device_indices))
+        core.commit_backup(leaf, torch.arange(len(device_value)), comp_xfers)
+        publish = cache._backup_publish_node_ids(leaf, comp_xfers)
+        self.assertIn(ancestor, publish)
+        cache._track_write_through_node(
+            leaf, lock_params=None, publish_node_ids=publish
+        )
+        cache._finish_write_through_ack(leaf)
+        cache._demote(leaf, tracker=defaultdict(int))
+        replay_host_events()
+        self.assertFalse(core.is_backuped(ancestor))
+        self.assertEqual(
+            host_tier, {hash_str_to_int64(h) for h in core.get_hash_values(leaf)}
+        )
+
+        # Host pressure: the ancestor's own backup fails and its subtree is dropped.
+        dropped = core.drop_subtree_no_host(ancestor)
+        self.assertTrue(dropped.is_dropped)
+        dropped.device_frees.clear()
+        dropped.host_frees.clear()
+        replay_host_events()
+        self.assertEqual(host_tier, set())
 
     def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)

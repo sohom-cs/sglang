@@ -732,7 +732,7 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
-        host store event for each acked node."""
+        host store event for each acked node whose Full KV is on host."""
         ...
 
     @abstractmethod
