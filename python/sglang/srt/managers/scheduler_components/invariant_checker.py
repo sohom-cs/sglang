@@ -50,6 +50,24 @@ logger = logging.getLogger(__name__)
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
+def _find_shared_pages(
+    *, rows: torch.Tensor, own: torch.Tensor, page_size: int
+) -> Tuple[torch.Tensor, List[int]]:
+    """Pages in the masked part of more than one row, and the rows holding the
+    first of them."""
+    num_rows = rows.shape[0]
+    row_ids = torch.arange(num_rows, device=rows.device)[:, None].expand_as(own)
+    # One key per (page, row): a row repeats its page once per token.
+    pages = (rows[own] // page_size).to(torch.int64)
+    keys = torch.unique(pages * num_rows + row_ids[own])
+    key_pages = keys // num_rows
+    uniq, counts = torch.unique_consecutive(key_pages, return_counts=True)
+    shared = uniq[counts > 1]
+    if shared.numel() == 0:
+        return shared, []
+    return shared, (keys[key_pages == shared[0]] % num_rows).tolist()
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
     is_hybrid_swa: bool
@@ -69,6 +87,9 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
+    # On PD decode a request owns its row from preallocation to release, also
+    # while queued for transfer or admission, or held for a deferred release.
+    get_disagg_decode_reqs: Callable = field(default=lambda: [])
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -282,6 +303,8 @@ class SchedulerInvariantChecker:
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
             reqs.append(chunked_req)
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            reqs += self.get_disagg_decode_reqs()
 
         # A request running on a session's record does not own that row.
         session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
@@ -351,15 +374,18 @@ class SchedulerInvariantChecker:
         """committed<=allocated for every req/slot, and no double free:
           A. no owner references a page that is in the free pool (use-after-free).
           B. the free pool has no duplicate pages (two owners freed the same page).
+          C. no page is in two owners' own ranges [cache_protected_len, allocated).
         All heavy work runs on GPU to avoid per-token device->host sync."""
         rtt = self.req_to_token_pool.req_to_token
         row_width = rtt.shape[1]
 
         def _add_owner(label, kv):
             assert 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width
-            owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
+            owners.append(
+                (label, kv.req_pool_idx, kv.cache_protected_len, kv.kv_allocated_len)
+            )
 
-        owners: list[tuple[str, Optional[int], int]] = []
+        owners: list[tuple[str, Optional[int], int, int]] = []
         for req in self._requests_owning_rows():
             _add_owner(f"req {req.rid}", req.kv)
         for sid, kv in self.tree_cache.session_records().items():
@@ -367,15 +393,19 @@ class SchedulerInvariantChecker:
                 _add_owner(f"slot {sid[:8]}", kv)
 
         active = [
-            (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0
+            (label, rpi, pl, al)
+            for label, rpi, pl, al in owners
+            if rpi is not None and al > 0
         ]
         if not active:
             return
 
-        idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
-        allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
-        mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
-        owner_locs = rtt[idx][mask]
+        idx = torch.as_tensor([rpi for _, rpi, _, _ in active], device=rtt.device)
+        allocs = torch.as_tensor([al for _, _, _, al in active], device=rtt.device)
+        positions = torch.arange(row_width, device=rtt.device)[None, :]
+        mask = positions < allocs[:, None]
+        rows = rtt[idx]
+        owner_locs = rows[mask]
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
         # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator;
@@ -423,6 +453,24 @@ class SchedulerInvariantChecker:
                 "count_memory_leak_warnings",
                 f"KV page use-after-free: {stale.numel()} owner page refs are in "
                 f"the free pool, sample pages={torch.unique(stale)[:8].tolist()}.",
+            )
+
+        # Check C: pages below cache_protected_len belong to the tree and may be
+        # shared; a page above it belongs to exactly one owner.
+        protected = torch.as_tensor([pl for _, _, pl, _ in active], device=rtt.device)
+        shared, holder_ids = _find_shared_pages(
+            rows=rows,
+            own=mask & (positions >= protected[:, None]),
+            page_size=sub_allocs[0].page_size,
+        )
+        if shared.numel() > 0:
+            holders = " and ".join(active[i][0] for i in holder_ids)
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                "count_memory_leak_warnings",
+                f"KV page owned twice: page {shared[0].item()} is in the own "
+                f"ranges of {holders}; shared pages: {shared.numel()}.",
             )
 
     def _check_req_pool(self):

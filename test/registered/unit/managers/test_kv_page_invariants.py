@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,6 +38,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         get_last_batch = lambda self: None
         get_running_batch = lambda self: None
         get_chunked_req = lambda self: None
+        disaggregation_mode = DisaggregationMode.NULL
+        get_disagg_decode_reqs = lambda self: []
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -51,10 +54,11 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
 
 class _FakeOwner:
     # A req or a session slot; the checker reads only `kv` (and `rid` for reqs).
-    def __init__(self, rpi, committed, allocated, rid=None):
+    def __init__(self, rpi, committed, allocated, rid=None, protected=0):
         self.rid = rid
         self.kv = ReqKvInfo(
             req_pool_idx=rpi,
+            cache_protected_len=protected,
             kv_committed_len=committed,
             kv_allocated_len=allocated,
         )
@@ -132,6 +136,47 @@ class TestKVPageInvariants(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
+
+    def test_page_in_two_owners_own_ranges_raises(self):
+        """A page handed to a second live request while its owner still holds it
+        is reported, also when the owner is a PD decode request outside the batches."""
+        for second in ("running_batch", "disagg_decode"):
+            with self.subTest(second=second):
+                chk, rtt, tc, alloc = _make_checker(
+                    free_pages=torch.arange(100, 200, dtype=torch.int64)
+                )
+                rtt[0, :_PAGE_SIZE] = torch.arange(_PAGE_SIZE)
+                rtt[1, :_PAGE_SIZE] = torch.arange(_PAGE_SIZE)  # page 0 again
+                a = _FakeOwner(0, _PAGE_SIZE, _PAGE_SIZE, rid="a")
+                b = _FakeOwner(1, _PAGE_SIZE, _PAGE_SIZE, rid="b")
+                chk.get_last_batch = lambda: SimpleNamespace(reqs=[a])
+                if second == "running_batch":
+                    chk.get_running_batch = lambda: SimpleNamespace(reqs=[b])
+                else:
+                    chk.disaggregation_mode = DisaggregationMode.DECODE
+                    chk.get_disagg_decode_reqs = lambda: [b]
+                with self.assertRaisesRegex(
+                    ValueError, "page 0 is in the own ranges of req a and req b"
+                ):
+                    chk._check_kv_page_invariants()
+
+    def test_shared_prefix_and_session_record_are_single_owners(self):
+        """Pages below cache_protected_len are the tree's and may be shared; a
+        request running on a session's record is the same owner as the slot."""
+        chk, rtt, tc, alloc = _make_checker(
+            free_pages=torch.arange(100, 200, dtype=torch.int64)
+        )
+        rtt[0, : 2 * _PAGE_SIZE] = torch.arange(2 * _PAGE_SIZE)  # pages 0, 1
+        rtt[1, :_PAGE_SIZE] = torch.arange(_PAGE_SIZE)  # shared prefix page 0
+        rtt[1, _PAGE_SIZE : 2 * _PAGE_SIZE] = torch.arange(
+            2 * _PAGE_SIZE, 3 * _PAGE_SIZE
+        )  # page 2
+        a = _FakeOwner(0, 2 * _PAGE_SIZE, 2 * _PAGE_SIZE, rid="a", protected=_PAGE_SIZE)
+        b = _FakeOwner(1, 2 * _PAGE_SIZE, 2 * _PAGE_SIZE, rid="b", protected=_PAGE_SIZE)
+        tc.session_records()["session-b"] = b.kv
+        chk.get_last_batch = lambda: SimpleNamespace(reqs=[a, b])
+        chk._check_kv_page_invariants()
+        self.assertEqual(chk.count_memory_leak_warnings, 0)
 
 
 if __name__ == "__main__":

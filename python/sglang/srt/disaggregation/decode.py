@@ -143,6 +143,9 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+        DecodeKVCacheOffloadManager,
+    )
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -3020,6 +3023,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
 
+    def deferred_release_reqs(self) -> List[Req]:
+        return [decode_req.req for decode_req, *_ in self._deferred_releases]
+
     def _observe_deferred_kv_release(
         self, duration_seconds: float, outcome: str
     ) -> None:
@@ -3102,6 +3108,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
         pass
+
+
+def decode_reqs_outside_batches(
+    *,
+    waiting_queue: List[Req],
+    prealloc_queue: DecodePreallocQueue,
+    transfer_queue: DecodeTransferQueue,
+    offload_manager: Optional[DecodeKVCacheOffloadManager],
+) -> List[Req]:
+    """Requests a decode worker tracks outside its batches; the ones holding a
+    req_to_token row own KV."""
+    reqs = [
+        *waiting_queue,
+        *(decode_req.req for decode_req in prealloc_queue.queue),
+        *prealloc_queue.retracted_queue,
+        *prealloc_queue.held_rebootstrap_reqs,
+        *(decode_req.req for decode_req in transfer_queue.queue),
+        *transfer_queue.deferred_release_reqs(),
+    ]
+    if offload_manager is not None:
+        # A finished request keeps its row until its last D2H copy completes.
+        reqs += list(offload_manager.offload_inflight)
+    return reqs
 
 
 class SchedulerDisaggregationDecodeMixin:

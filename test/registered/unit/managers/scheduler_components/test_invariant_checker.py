@@ -12,9 +12,15 @@ maybe_stub_sgl_kernel()
 
 import torch
 
+from sglang.srt.disaggregation.decode import (
+    DecodeReqToTokenPool,
+    DecodeRequest,
+    DecodeTransferQueue,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
@@ -24,8 +30,10 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_swa_tokens,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -361,6 +369,146 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         )
         self.assertTrue(leak, msg)
         self.assertIn("align", msg.lower())
+
+
+class _HeldReq:
+    # Hashable like Req: the decode offload manager keys in-flight copies by request.
+    def __init__(self, rid):
+        self.rid = rid
+        self.kv = ReqKvInfo()
+        self.beam_group = None
+
+
+class TestPdDecodeKvOwners(CustomTestCase):
+    """A PD decode worker holds KV for requests outside its batches; the checker
+    the scheduler builds must count them and see a second owner on their pages."""
+
+    PAGE_SIZE = 4
+    NUM_TOKENS = 2 * PAGE_SIZE
+
+    def setUp(self):
+        super().setUp()
+        parallel = patch.object(
+            invariant_checker,
+            "get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=False),
+        )
+        parallel.start()
+        self.addCleanup(parallel.stop)
+
+    def _make_scheduler(self):
+        self.allocator = PagedTokenToKVPoolAllocator(
+            size=8 * self.PAGE_SIZE,
+            page_size=self.PAGE_SIZE,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.req_pool = DecodeReqToTokenPool(
+            size=2,
+            max_context_len=64,
+            device="cpu",
+            enable_memory_saver=False,
+            pre_alloc_size=2,
+        )
+        transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer_queue.queue = []
+        transfer_queue._deferred_releases = []
+        transfer_queue.deferred_kv_release_timeout = 30.0
+        batch = SimpleNamespace(reqs=[], is_empty=lambda: not batch.reqs)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.__dict__.update(
+            is_hybrid_swa=False,
+            is_hybrid_ssm=False,
+            enable_hisparse=False,
+            disaggregation_mode=DisaggregationMode.DECODE,
+            page_size=self.PAGE_SIZE,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            max_total_num_tokens=self.allocator.size,
+            tree_cache=ChunkCache(
+                CacheInitParams(
+                    disable=True,
+                    req_to_token_pool=self.req_pool,
+                    token_to_kv_pool_allocator=self.allocator,
+                    page_size=self.PAGE_SIZE,
+                )
+            ),
+            token_to_kv_pool_allocator=self.allocator,
+            req_to_token_pool=self.req_pool,
+            session_controller=None,
+            hisparse_coordinator=None,
+            last_batch=batch,
+            running_batch=batch,
+            chunked_req=None,
+            waiting_queue=[],
+            disagg_decode_prealloc_queue=SimpleNamespace(
+                queue=[], retracted_queue=[], held_rebootstrap_reqs=[]
+            ),
+            disagg_decode_transfer_queue=transfer_queue,
+            decode_offload_manager=None,
+            scheduler_stage_metrics=None,
+        )
+        scheduler.init_pool_stats_observer()
+        scheduler.init_invariant_checker()
+        return scheduler
+
+    def _req(self, rid):
+        req = _HeldReq(rid)
+        self.req_pool.alloc([req])
+        locs = self.allocator.alloc(self.NUM_TOKENS)
+        self.req_pool.write((req.kv.req_pool_idx, slice(0, self.NUM_TOKENS)), locs)
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = self.NUM_TOKENS
+        return req
+
+    @staticmethod
+    def _hold(scheduler, req, where):
+        if where == "waiting_queue":
+            scheduler.waiting_queue.append(req)
+        elif where == "transfer_queue":
+            scheduler.disagg_decode_transfer_queue.queue.append(
+                DecodeRequest(req=req, kv_receiver=None)
+            )
+        elif where == "deferred_release":
+            scheduler.disagg_decode_transfer_queue._defer_release(
+                DecodeRequest(
+                    req=req, kv_receiver=SimpleNamespace(bootstrap_infos=[{}])
+                )
+            )
+        else:
+            scheduler.decode_offload_manager = SimpleNamespace(
+                offload_inflight={req: 1}
+            )
+
+    def test_requests_outside_batches_own_their_rows(self):
+        for where in ("waiting_queue", "transfer_queue", "deferred_release", "offload"):
+            with self.subTest(where=where):
+                scheduler = self._make_scheduler()
+                scheduler.running_batch.reqs = [self._req("running")]
+                self._hold(scheduler, self._req("held"), where)
+                with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(True):
+                    scheduler.invariant_checker.self_check_during_busy()
+
+    def test_pages_freed_under_a_held_request_are_reported(self):
+        """A flush that resets the pools while a decode request still holds KV
+        (deferred release, or waiting for admission) hands its pages to the next
+        request; the checks must report that, not balance it."""
+        for where in ("deferred_release", "waiting_queue"):
+            with self.subTest(where=where):
+                scheduler = self._make_scheduler()
+                self._hold(scheduler, self._req("held"), where)
+                self.req_pool.clear()
+                self.allocator.clear()
+                scheduler.running_batch.reqs = [self._req("newcomer")]
+                checker = scheduler.invariant_checker
+                with self.assertRaisesRegex(AssertionError, "Full Pool Mem Leak"):
+                    checker.self_check_during_busy()
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "page 1 is in the own ranges of req newcomer and req held",
+                ):
+                    checker._check_kv_page_invariants()
 
 
 if __name__ == "__main__":

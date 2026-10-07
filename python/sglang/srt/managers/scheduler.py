@@ -82,6 +82,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
+    decode_reqs_outside_batches,
 )
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
@@ -2531,6 +2532,12 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_disagg_decode_reqs=lambda: decode_reqs_outside_batches(
+                waiting_queue=self.waiting_queue,
+                prealloc_queue=self.disagg_decode_prealloc_queue,
+                transfer_queue=self.disagg_decode_transfer_queue,
+                offload_manager=self.decode_offload_manager,
+            ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
