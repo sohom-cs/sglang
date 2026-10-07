@@ -19,7 +19,7 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import NextBatchPlan, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -385,6 +385,10 @@ class TestPdDecodeKvOwners(CustomTestCase):
 
     PAGE_SIZE = 4
     NUM_TOKENS = 2 * PAGE_SIZE
+    DECODE_LOOPS = (
+        Scheduler.event_loop_normal_disagg_decode,
+        Scheduler.event_loop_overlap_disagg_decode,
+    )
 
     def setUp(self):
         super().setUp()
@@ -509,6 +513,70 @@ class TestPdDecodeKvOwners(CustomTestCase):
                     "page 1 is in the own ranges of req newcomer and req held",
                 ):
                     checker._check_kv_page_invariants()
+
+    @staticmethod
+    def _run_decode_step(scheduler, event_loop):
+        # One iteration of the real loop; intake, transfer polling and the forward
+        # are stubbed, and admission moves the waiting queue into the batch.
+        def next_plan(running_batch):
+            reqs = running_batch.reqs + scheduler.waiting_queue
+            scheduler.waiting_queue = []
+            batch = SimpleNamespace(reqs=reqs, copy=lambda: batch)
+            return NextBatchPlan(batch_to_run=batch, running_batch=batch)
+
+        def run_batch(batch):
+            scheduler.gracefully_exit = True
+
+        scheduler.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries = (
+            lambda: None
+        )
+        scheduler.__dict__.update(
+            gracefully_exit=False,
+            _engine_paused=False,
+            ingest_requests=lambda: None,
+            process_decode_queue=lambda: None,
+            get_next_disagg_decode_batch_to_run=next_plan,
+            ngram_embedding_manager=SimpleNamespace(
+                prepare_for_forward=lambda batch, chunked_req: batch
+            ),
+            run_batch=run_batch,
+            process_batch_result=lambda batch, result: None,
+            is_disable_overlap_for_batch=lambda batch, last_batch: False,
+            _apply_war_barrier=lambda: None,
+            launch_batch_sample_if_needed=lambda result, batch: None,
+        )
+        event_loop(scheduler)
+
+    def test_decode_step_admitting_a_request_passes_the_busy_check(self):
+        """The decode loops check after the step's batch is set: a request moved
+        from the waiting queue into the batch is counted once, beside a held one."""
+        for event_loop in self.DECODE_LOOPS:
+            with self.subTest(loop=event_loop.__name__):
+                scheduler = self._make_scheduler()
+                self._hold(scheduler, self._req("held"), "deferred_release")
+                scheduler.waiting_queue.append(self._req("admitted"))
+                with (
+                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+                    self.assertLogs(invariant_checker.logger, "INFO") as logs,
+                ):
+                    self._run_decode_step(scheduler, event_loop)
+                self.assertIn("uncached=16", logs.output[0])
+
+    def test_decode_step_on_pages_of_a_deferred_release_is_reported(self):
+        """A flush while a deferred release holds KV frees its pages and the next
+        request gets them; the decode step that runs that request reports it."""
+        for event_loop in self.DECODE_LOOPS:
+            with self.subTest(loop=event_loop.__name__):
+                scheduler = self._make_scheduler()
+                self._hold(scheduler, self._req("held"), "deferred_release")
+                self.req_pool.clear()
+                self.allocator.clear()
+                scheduler.waiting_queue.append(self._req("newcomer"))
+                with (
+                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+                    self.assertRaisesRegex(AssertionError, "Full Pool Mem Leak"),
+                ):
+                    self._run_decode_step(scheduler, event_loop)
 
 
 if __name__ == "__main__":
