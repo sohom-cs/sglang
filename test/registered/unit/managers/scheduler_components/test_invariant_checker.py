@@ -33,7 +33,6 @@ from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAll
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -431,12 +430,13 @@ class TestPdDecodeKvOwners(CustomTestCase):
             full_tokens_per_layer=None,
             swa_tokens_per_layer=None,
             max_total_num_tokens=self.allocator.size,
-            tree_cache=ChunkCache(
+            tree_cache=UnifiedRadixCache(
                 CacheInitParams(
                     disable=True,
                     req_to_token_pool=self.req_pool,
                     token_to_kv_pool_allocator=self.allocator,
                     page_size=self.PAGE_SIZE,
+                    tree_components=(ComponentType.FULL,),
                 )
             ),
             token_to_kv_pool_allocator=self.allocator,
