@@ -477,7 +477,10 @@ class TestPdDecodeKvOwners(CustomTestCase):
         elif where == "deferred_release":
             scheduler.disagg_decode_transfer_queue._defer_release(
                 DecodeRequest(
-                    req=req, kv_receiver=SimpleNamespace(bootstrap_infos=[{}])
+                    req=req,
+                    kv_receiver=SimpleNamespace(
+                        bootstrap_infos=[{}], abort_notified=True
+                    ),
                 )
             )
         else:
