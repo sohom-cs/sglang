@@ -274,7 +274,19 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if not req.skip_radix_cache_insert:
-        tree_cache.checkpoint(req, up_to=req.extend_end)
+        up_to = req.extend_end
+        if (
+            get_serving().strip_thinking_cache
+            and req.reasoning_tokens > 0
+            and not tree_cache.supports_mamba()
+        ):
+            # A re-prefill after a retraction covers the earlier thinking and
+            # answer: publish only the prompt and what the match already holds.
+            # A mamba tree would key the post-thinking state under the prompt.
+            up_to = min(
+                up_to, max(len(req.origin_input_ids), req.kv.cache_protected_len)
+            )
+        tree_cache.checkpoint(req, up_to=up_to)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
 

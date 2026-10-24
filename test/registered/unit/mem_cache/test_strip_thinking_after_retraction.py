@@ -1,8 +1,8 @@
-"""--strip-thinking-cache caps Req.owned_kv_len() at the prompt. A retracted
-request is re-prefilled over prompt + output, and the tree then holds part of
-that output (the re-prefill's checkpoint inserts it, or its match finds it), so
-cache_protected_len > prompt. Releasing it must never free those tree-owned
-slots: no slot may be free twice, and every slot must come back."""
+"""--strip-thinking-cache caps Req.owned_kv_len() at the prompt, and a
+re-prefill's checkpoint stops there too. A retracted request is re-prefilled
+over prompt + output, and its match can already find part of that output in the
+tree, so cache_protected_len > prompt. Releasing it must never free those
+tree-owned slots: no slot may be free twice, and every slot must come back."""
 
 import contextlib
 import unittest
@@ -20,7 +20,10 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator  # noqa: E402
 from sglang.srt.mem_cache.allocator.paged import (  # noqa: E402
     PagedTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams  # noqa: E402
+from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
+    EvictParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
 from sglang.srt.mem_cache.common import (  # noqa: E402
     checkpoint_kv_cache,
@@ -30,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool import (  # noqa: E402
     MHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
 from sglang.srt.mem_cache.unified_cache.components.base import (  # noqa: E402
     ComponentType,
 )
@@ -180,11 +184,14 @@ class _RetractionCase(CustomTestCase):
         self.assertEqual(len(free), len(set(free)), "a KV slot is free twice")
         self.assertEqual(self.allocator.available_size(), POOL)
 
+    def _cached_len(self, ids):
+        key = RadixKey(array("q", ids), extra_key=None)
+        return self.cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
+
 
 class TestStripThinkingAfterRetraction(_RetractionCase):
     def test_finish_after_reprefill_frees_each_slot_once(self):
         req = self._prefill_and_decode(self._admit(PROMPT, EARLIER_OUTPUT))
-        self.assertGreater(req.kv.cache_protected_len, PROMPT)
         self._release_and_check(req, finish=True)
 
     def test_second_retraction_frees_each_slot_once(self):
@@ -204,6 +211,17 @@ class TestStripThinkingAfterRetraction(_RetractionCase):
                 # The first chunk ends inside the earlier output.
                 self._prefill_and_decode(req, chunk_end=PROMPT + 2)
                 self._release_and_check(req, finish=finish)
+
+    def test_reprefill_keeps_earlier_output_out_of_the_tree(self):
+        reprefilled = list(range(1, PROMPT + 1)) + EARLIER_OUTPUT
+        for chunk_end in (None, PROMPT + 2):
+            with self.subTest(chunk_end=chunk_end):
+                self._build()
+                req = self._admit(PROMPT, EARLIER_OUTPUT)
+                self._prefill_and_decode(req, chunk_end=chunk_end)
+                self.assertEqual(self._cached_len(reprefilled), PROMPT)
+                self.assertEqual(req.owned_kv_len(), PROMPT)
+                self._release_and_check(req, finish=True)
 
     def test_reprefill_matching_cached_output_frees_each_slot_once(self):
         for finish in (True, False):
@@ -230,7 +248,6 @@ class TestStripThinkingAfterRetractionPaged(_RetractionCase):
                     self._build()
                     req = self._admit(prompt, EARLIER_OUTPUT)
                     self._prefill_and_decode(req)
-                    self.assertGreater(req.kv.cache_protected_len, prompt)
                     self._release_and_check(req, finish=finish)
 
 
